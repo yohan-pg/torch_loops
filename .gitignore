@@ -1,5 +1,5 @@
 .venv
 .vscode
 .python-version
-dist
+/dist/
 **/__pycache__/
