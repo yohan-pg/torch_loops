@@ -1,5 +1,5 @@
 import torch
-from torch_loops import training_loop, evaluation_loop, aggregate
+from torch_loops import training_loop, evaluation_loop
 
 
 def test_training_loop(tolerence=0.1, num_batches=1000):
@@ -9,24 +9,30 @@ def test_training_loop(tolerence=0.1, num_batches=1000):
     model = torch.nn.Linear(2, 2)
     opt = torch.optim.Adam(model.parameters(), lr=1e-1)
     criterion = torch.nn.MSELoss()
+    criterions = dict(mse=(1.0, criterion))
+    training = training_loop(
+        # todo this is wrong, should be model(x), but the type hint is wrong
+        model=model.forward,
+        dataloader=iter([(x, y)] * num_batches),
+        criterions=criterions,
+        optimizers=[opt],
+    )
 
-    for i, (y_hat, losses) in enumerate(
-        training_loop(
-            # todo this is wrong, should be model(x), but the type hint is wrong
-            model=model.forward,
-            dataloader=iter([(x, y)] * num_batches),
-            criterions=dict(mse=criterion),
-            optimizer=opt,
-        )
-    ):
-        assert y_hat.shape == y.shape
-        assert losses["mse"].shape == ()
-        assert losses["total"].shape == ()
+    for i, losses in enumerate(training()):
+        assert set(losses.columns) == set(criterions.keys()) | set(["objective"])
+
+        if i == 0:
+            assert losses.shape == (1, 2)
 
         if i == num_batches - 1:
-            assert criterion(y_hat, y).item() < tolerence
+            assert losses.shape == (num_batches, 2)
+            assert criterion(model(x), y).item() < tolerence
             return
+
+    #! fails to test ending
     assert False
+
+    # todo test the weighting of the losses
 
 
 def test_inference_loop(num_batches=1000):
@@ -35,47 +41,23 @@ def test_inference_loop(num_batches=1000):
 
     model = torch.nn.Linear(2, 2)
     criterion = torch.nn.MSELoss()
-
-    for i, (y_hat, losses) in enumerate(
-        evaluation_loop(
-            # todo this is wrong, should be model(x), but the type hint is wrong
-            dataloader=zip(xs, ys),
-            model=model.forward,
-            criterions=dict(mse=criterion),
-        )
-    ):
-        assert not y_hat.requires_grad
-        assert y_hat.shape == ys[0].shape
-        assert losses["mse"].shape == ()
-
-        if i == num_batches - 1:
-            return
-    assert False
-
-
-def test_aggregate(num_batches=1000, window_size=10, batch_size=3):
-    xs = [torch.randn(batch_size, 2) for _ in range(num_batches)]
-    ys = [torch.randn(batch_size, 2) for _ in range(num_batches)]
-
-    model = torch.nn.Linear(2, 2)
-    criterion = torch.nn.MSELoss()
-
-    loop = evaluation_loop(
+    evaluation = evaluation_loop(
         # todo this is wrong, should be model(x), but the type hint is wrong
         dataloader=zip(xs, ys),
         model=model.forward,
-        criterions=dict(mse=criterion),
+        metrics=dict(mse=criterion),
     )
 
-    preds_stats, losses_stats = aggregate(loop, window_size=window_size)
-    
-    assert len(preds_stats) == num_batches // window_size
-    assert len(losses_stats) == num_batches // window_size
+    for i, (y_hat, losses) in enumerate(evaluation()):
+        assert not y_hat.requires_grad
+        assert y_hat.shape == ys[0].shape
 
-    assert len(preds_stats[0]) == 1
-    assert preds_stats[0][0].shape == (batch_size * window_size, 2)
+        if i == 0:
+            assert losses["mse"].shape == (1,)
 
-    assert len(losses_stats[0]) == 1
-    assert len(losses_stats[0]["mse"]) == 2
-    assert losses_stats[0]["mse"][0].shape == ()
-    assert losses_stats[0]["mse"][1].shape == ()
+        if i == num_batches - 1:
+            assert losses["mse"].shape == (num_batches,)
+            return
+
+    #! fails to test ending
+    assert False

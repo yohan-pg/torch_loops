@@ -7,6 +7,8 @@ from torch.cuda.amp.autocast_mode import autocast
 from torch.cuda.amp.grad_scaler import GradScaler
 import itertools
 import contextlib
+import pandas as pd
+from tqdm import tqdm
 
 
 Inputs = TypeVar("Inputs", bound=dict[str, torch.Tensor] | torch.Tensor)
@@ -14,110 +16,96 @@ Preds = TypeVar("Preds", bound=dict[str, torch.Tensor] | torch.Tensor)
 Targets = TypeVar("Targets", bound=dict[str, torch.Tensor] | torch.Tensor)
 
 Loss = torch.Tensor
-Losses = dict[str, Loss]
+Losses = pd.DataFrame
 
-Metric = torch.Tensor  # Metrics are losses which do not require differentiability
+Score = torch.Tensor  # Scores are losses which do not require differentiability
 Metrics = dict[str, torch.Tensor]
 
 
 def training_loop(
-    *,
     model: Callable[[Inputs], Preds],
-    dataloader: Iterator[tuple[Inputs, Targets]],  # type: ignore
-    criterions: dict[str, nn.Module],
-    optimizer: torch.optim.Optimizer,
-    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    amp: bool = False,
-) -> Iterator[tuple[Preds, Losses]]:
-    if amp:
-        scaler = GradScaler()
-    else:
-        scaler = None
+    *,
+    dataloader: Iterable[tuple[Inputs, Targets]],  # type: ignore
+    criterions: dict[str, tuple[float, Callable[[Inputs, Targets], Loss]]],
+    optimizers: list[torch.optim.Optimizer],
+    schedulers: list[torch.optim.lr_scheduler._LRScheduler] = [],
+) -> Callable[[], Iterator[Losses]]:
+    def loop():
+        assert len(optimizers) > 0
 
-    for inputs, targets in dataloader:
-        with autocast() if amp else contextlib.nullcontext():
+        losses = pd.DataFrame(columns=list(criterions.keys()) + ["objective"])
+
+        def step_fn(inputs, targets):
             preds = model(inputs)
-            losses = {
-                key: criterion(preds, targets) for key, criterion in criterions.items()
+
+            # Compute the losses for this iteration
+            step_losses = {
+                label: criterion(preds, targets)
+                for label, (_, criterion) in criterions.items()
             }
-            total_loss = sum(
-                [value.mean(dim=0) for value in losses.values()], torch.tensor(0.0)
+            step_losses["objective"] = sum(
+                [
+                    criterions[label][0] * loss.mean(dim=0)
+                    for label, loss in step_losses.items()
+                ],
+                torch.tensor(0.0),
             )
 
-        optimizer.zero_grad()
+            # Append the losses to the dataframe object
+            frame = pd.DataFrame(
+                {label: [loss.item()] for label, loss in step_losses.items()}
+            )
+            assert set(frame.columns) == set(losses.columns)
+            losses.loc[len(losses)] = frame.loc[0]  # todo nicer
 
-        if amp:
-            assert scaler is not None
-            scaler.scale(total_loss).backward()  # type: ignore
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            total_loss.backward()
-            optimizer.step()
+            # Run backprop and return
+            step_losses[
+                "objective"
+            ].backward()  #! what about 2 optimizers? this will call `backward` twice
+            return step_losses["objective"]
 
-        if scheduler is not None:
-            scheduler.step()
+        i = 0
+        while True:
+            for inputs, targets in dataloader:
+                for optimizer in optimizers:
+                    optimizer.zero_grad()
+                    optimizer.step(lambda: step_fn(inputs, targets))
 
-        # todo where to place this yield statement exactly?
-        yield preds, losses | {"total": total_loss}
+                for scheduler in schedulers:
+                    scheduler.step()
+
+                yield losses
+
+                i += 1
+
+    return loop
 
 
-@torch.inference_mode()
+
 def evaluation_loop(
-    *,
     model: Callable[[Inputs], Preds],
-    dataloader: Iterator[Tuple[Inputs, Targets]],
-    criterions: dict[str, Callable[[Preds, Targets], Metric]],
-    amp: bool = False,
-) -> Iterator[tuple[Preds, Metrics]]:
-    for inputs, targets in dataloader:
-        with autocast() if amp else contextlib.nullcontext():
+    *,
+    dataloader: Iterable[Tuple[Inputs, Targets]],
+    metrics: dict[str, Callable[[Preds, Targets], Score]],
+) -> Callable[[], Iterable[tuple[Preds, pd.DataFrame]]]:
+
+    @torch.inference_mode()
+    def loop():
+        scores = pd.DataFrame(columns=list(metrics.keys()))
+
+        for inputs, targets in tqdm(dataloader, leave=False):
             preds = model(inputs)
-            losses = {
-                key: criterion(preds, targets) for key, criterion in criterions.items()
+            step_scores = {
+                label: criterion(preds, targets) for label, criterion in metrics.items()
             }
 
-        yield preds, losses
+            # Append the metrics to the dataframe object
+            frame = pd.DataFrame(
+                {label: [loss.item()] for label, loss in step_scores.items()}
+            )
+            assert set(frame.columns) == set(scores.columns)
+            scores.loc[len(scores)] = frame.loc[0]  # todo nicer
 
+            yield preds, scores
 
-def aggregate(
-    loop,
-    *,
-    window_size: int,
-    pred_transforms: Optional[list[Callable]] = [lambda x: x.flatten(0, 1)],
-    loss_transforms: Optional[list[Callable]] = [torch.mean, torch.std],
-):
-    preds_agg = []
-    preds_window = []
-
-    losses_agg = []
-    losses_window = []
-
-    def step(collection, window, agg, transforms):
-        if transforms is not None:
-            window.append(collection)
-
-            if i % window_size == window_size - 1:
-                if isinstance(collection, dict):
-                    window_transposed = {
-                        label: torch.stack([values[label] for values in window])
-                        for label in collection.keys()
-                    }
-                    agg.append(
-                        {
-                            key: [transform(stack) for transform in transforms]
-                            for key, stack in window_transposed.items()
-                        }
-                    )
-                    window.clear()
-                else:
-                    agg.append(
-                        [transform(torch.stack(window)) for transform in transforms]
-                    )
-                    window.clear()
-
-    for i, (preds, losses) in enumerate(loop):
-        step(preds, preds_window, preds_agg, pred_transforms)
-        step(losses, losses_window, losses_agg, loss_transforms)
-
-    return preds_agg, losses_agg
+    return loop
