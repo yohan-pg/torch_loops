@@ -5,107 +5,120 @@ from torch.utils.data import DataLoader
 
 from torch.cuda.amp.autocast_mode import autocast
 from torch.cuda.amp.grad_scaler import GradScaler
-import itertools
-import contextlib
+from contextlib import nullcontext
 import pandas as pd
 from tqdm import tqdm
+import dataclasses
+from dataclasses import dataclass, field
 
 
-Inputs = TypeVar("Inputs", bound=dict[str, torch.Tensor] | torch.Tensor)
-Preds = TypeVar("Preds", bound=dict[str, torch.Tensor] | torch.Tensor)
-Targets = TypeVar("Targets", bound=dict[str, torch.Tensor] | torch.Tensor)
+Inputs = TypeVar("Inputs")
+Preds = TypeVar("Preds")
+Targets = TypeVar("Targets")
 
 Loss = torch.Tensor
-Losses = pd.DataFrame
+Losses = dict[str, Loss]
 
-Score = torch.Tensor  # Scores are losses which do not require differentiability
-Metrics = dict[str, torch.Tensor]
+# Scores are losses which do not require differentiability
+Score = torch.Tensor  
+Scores = dict[str, Score]
+
+Weight = float
+Criterion = Callable[[Preds, Targets], Loss]
 
 
-def training_loop(
-    model: Callable[[Inputs], Preds],
-    *,
-    dataloader: Iterable[tuple[Inputs, Targets]],  # type: ignore
-    criterions: dict[str, tuple[float, Callable[[Inputs, Targets], Loss]]],
-    optimizers: list[torch.optim.Optimizer],
-    schedulers: list[torch.optim.lr_scheduler._LRScheduler] = [],
-) -> Callable[[], Iterator[Losses]]:
-    def loop():
-        assert len(optimizers) > 0
+Metric = Callable[[Preds, Targets], Score]
 
-        losses = pd.DataFrame(columns=list(criterions.keys()) + ["objective"])
 
-        def step_fn(inputs, targets):
-            preds = model(inputs)
+@dataclass
+class TrainingLoop(Generic[Inputs, Preds, Targets]):
+    model: Callable[[Inputs], Preds]
+    _ = dataclasses.KW_ONLY
+    dataloader: Iterable[tuple[Inputs, Targets]]
+    criterions: dict[str, tuple[Weight, Criterion]]
+    optimizers: Iterable[torch.optim.Optimizer]
+    schedulers: Iterable[torch.optim.lr_scheduler._LRScheduler] = ()
+    amp: bool = True
+    seed: int = 0
 
-            # Compute the losses for this iteration
-            step_losses = {
-                label: criterion(preds, targets)
-                for label, (_, criterion) in criterions.items()
-            }
-            step_losses["objective"] = sum(
-                [
-                    criterions[label][0] * loss.mean(dim=0)
-                    for label, loss in step_losses.items()
-                ],
-                torch.tensor(0.0),
-            )
+    _scaler: Optional[GradScaler] = None
 
-            # Append the losses to the dataframe object
-            frame = pd.DataFrame(
-                {label: [loss.item()] for label, loss in step_losses.items()}
-            )
-            assert set(frame.columns) == set(losses.columns)
-            losses.loc[len(losses)] = frame.loc[0]  # todo nicer
+    def __post_init__(self):
+        self._scaler = GradScaler() if self.amp else None
 
-            # Run backprop and return
-            step_losses[
-                "objective"
-            ].backward()  #! what about 2 optimizers? this will call `backward` twice
-            return step_losses["objective"]
+    def step(self, inputs: Inputs, targets: Targets) -> tuple[Preds, dict[str, Loss]]:
+        preds = self.model(inputs)
+
+        losses = {
+            label: criterion(preds, targets)
+            for label, (_, criterion) in self.criterions.items()
+        }
+
+        objective = torch.tensor(0.0)
+        for label, loss in losses.items():
+            weight = self.criterions[label][0]
+            objective += weight * loss.mean(dim=0)
+
+        return preds, (losses | {"objective": objective})
+
+    def __iter__(self) -> Iterator[tuple[Preds, Losses]]:
+        torch.manual_seed(self.seed)
 
         i = 0
-        while True:
-            for inputs, targets in dataloader:
-                for optimizer in optimizers:
-                    optimizer.zero_grad()
-                    optimizer.step(lambda: step_fn(inputs, targets))
+        for inputs, targets in self.dataloader:
+            for optimizer in self.optimizers:
+                optimizer.zero_grad()
 
-                for scheduler in schedulers:
-                    scheduler.step()
+            with autocast() if self.amp else nullcontext():
+                preds, losses = self.step(inputs, targets)
 
-                yield losses
+            if self._scaler is not None:
+                self._scaler.scale(losses["objective"]).backward()  # type: ignore
+            else:
+                losses["objective"].backward()
 
-                i += 1
+            for optimizer in self.optimizers:
+                if self._scaler is not None:
+                    self._scaler.step(optimizer) # type: ignore
+                else:
+                    optimizer.step()
 
-    return loop
+            for scheduler in self.schedulers:
+                scheduler.step()
+
+            if self._scaler is not None:
+                self._scaler.update()
+
+            yield preds, losses
+
+            i += 1
 
 
+@dataclass
+class EvaluationLoop(Generic[Inputs, Preds, Targets]):
+    model: Callable[[Inputs], Preds]
+    _ = dataclasses.KW_ONLY
+    dataloader: Iterable[tuple[Inputs, Targets]]
+    metrics: dict[str, Callable[[Preds, Targets], Score]]
+    amp: bool = True
+    seed: int = 0
 
-def evaluation_loop(
-    model: Callable[[Inputs], Preds],
-    *,
-    dataloader: Iterable[Tuple[Inputs, Targets]],
-    metrics: dict[str, Callable[[Preds, Targets], Score]],
-) -> Callable[[], Iterable[tuple[Preds, pd.DataFrame]]]:
+    def __iter__(self) -> Iterator[tuple[Preds, Scores]]:
+        torch.manual_seed(self.seed)
 
-    @torch.inference_mode()
-    def loop():
-        scores = pd.DataFrame(columns=list(metrics.keys()))
+        with torch.inference_mode():
+            was_training = self.model.training
+            self.model.train(False)
+            
+            for inputs, targets in self.dataloader:
+                with autocast() if self.amp else nullcontext():
+                    preds = self.model(inputs)
+                    scores = {
+                        label: criterion(preds, targets)
+                        for label, criterion in self.metrics.items()
+                    }
 
-        for inputs, targets in tqdm(dataloader, leave=False):
-            preds = model(inputs)
-            step_scores = {
-                label: criterion(preds, targets) for label, criterion in metrics.items()
-            }
+                
+                    yield preds, scores
 
-            # Append the metrics to the dataframe object
-            frame = pd.DataFrame(
-                {label: [loss.item()] for label, loss in step_scores.items()}
-            )
-            assert set(frame.columns) == set(scores.columns)
-            scores.loc[len(scores)] = frame.loc[0]  # todo nicer
-
-            yield preds, scores
-
-    return loop
+            self.model.train(was_training)

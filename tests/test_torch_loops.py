@@ -1,63 +1,110 @@
 import torch
-from torch_loops import training_loop, evaluation_loop
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_loops import TrainingLoop, EvaluationLoop
 
 
-def test_training_loop(tolerence=0.1, num_batches=1000):
-    x = torch.randn(2, 2)
-    y = torch.randn(2, 2)
+def test_training_loop(tolerence=0.1, num_batches=1000, batch_size=3):
+    for amp in [True, False]:
+        inputs = torch.randn(batch_size, 2)
+        targets = torch.randn(batch_size, 2)
 
-    model = torch.nn.Linear(2, 2)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-1)
-    criterion = torch.nn.MSELoss()
-    criterions = dict(mse=(1.0, criterion))
-    training = training_loop(
-        # todo this is wrong, should be model(x), but the type hint is wrong
-        model=model.forward,
-        dataloader=iter([(x, y)] * num_batches),
-        criterions=criterions,
-        optimizers=[opt],
-    )
+        model = nn.Linear(2, 2)
+        training = TrainingLoop(
+            model,
+            dataloader=iter([(inputs, targets)] * num_batches),
+            criterions=dict(mse=(1.0, nn.MSELoss()), l1=(0.5, nn.L1Loss())),
+            optimizers=[torch.optim.Adam(model.parameters(), lr=1e-1)],
+            amp=amp
+        )
 
-    for i, losses in enumerate(training()):
-        assert set(losses.columns) == set(criterions.keys()) | set(["objective"])
+        i = 0
+        with torch.no_grad():
+            old_preds = model(inputs)
 
-        if i == 0:
-            assert losses.shape == (1, 2)
+        for i, (preds, losses) in enumerate(training):
+            # Autograd is enabled in the loop scope
+            assert torch.randn(2, requires_grad=True).square().grad_fn is not None
+            
+            # The prediction shapes are OK
+            assert preds.shape == targets.shape
 
-        if i == num_batches - 1:
-            assert losses.shape == (num_batches, 2)
-            assert criterion(model(x), y).item() < tolerence
-            return
+            # The predictions returned match are the predictions right before the step
+            assert preds.allclose(old_preds)
+            with torch.no_grad():
+                old_preds = model(inputs)
 
-    #! fails to test ending
-    assert False
+            # The predictions change
+            with torch.no_grad():
+                assert not preds.allclose(model(inputs))
+            
+            # The loss shapes are OK
+            for loss in losses.values():
+                assert loss.shape == () 
 
-    # todo test the weighting of the losses
+            # The losses include the final weighted objective
+            assert set(losses.keys()) == set(training.criterions.keys()) | set(["objective"])
 
+            # The losses are measured correctly
+            assert losses["mse"].allclose(F.mse_loss(preds, targets))
+            assert losses["l1"].allclose(F.l1_loss(preds, targets))
+            assert losses["objective"].allclose(1.0 * losses["mse"] + 0.5 * losses["l1"])
+
+            # Optimization converges
+            if i == num_batches - 1:
+                assert losses["objective"] < tolerence
+                assert losses["mse"] < tolerence
+                assert losses["l1"] < tolerence
+                
+        # Trainings passes over all batches onces
+        assert i == num_batches - 1 
+
+
+# todo test that grad is disabled
 
 def test_inference_loop(num_batches=1000):
-    xs = [torch.randn(2, 2) for _ in range(num_batches)]
-    ys = [torch.randn(2, 2) for _ in range(num_batches)]
+    for amp in [True, False]:
+        inputs = [torch.randn(2, 2) for _ in range(num_batches)]
+        targets = [torch.randn(2, 2) for _ in range(num_batches)]
 
-    model = torch.nn.Linear(2, 2)
-    criterion = torch.nn.MSELoss()
-    evaluation = evaluation_loop(
-        # todo this is wrong, should be model(x), but the type hint is wrong
-        dataloader=zip(xs, ys),
-        model=model.forward,
-        metrics=dict(mse=criterion),
-    )
+        model = nn.Linear(2, 2)
+        
+        evaluation = EvaluationLoop(
+            model,
+            dataloader=zip(inputs, targets),
+            metrics=dict(mse=nn.MSELoss(), l1=nn.L1Loss()),
+            amp=amp
+        )
 
-    for i, (y_hat, losses) in enumerate(evaluation()):
-        assert not y_hat.requires_grad
-        assert y_hat.shape == ys[0].shape
+        i = 0 
+        for i, (preds, scores) in enumerate(evaluation):
+            # Autograd is disabled in the loop scope
+            assert torch.randn(2, requires_grad=True).square().grad_fn is None
 
-        if i == 0:
-            assert losses["mse"].shape == (1,)
+            # The model is set to eval mode
+            assert not model.training
 
-        if i == num_batches - 1:
-            assert losses["mse"].shape == (num_batches,)
-            return
+            # The computations were performed without autograd
+            assert not preds.requires_grad
 
-    #! fails to test ending
-    assert False
+            # The predictions are computed correctly
+            assert preds.shape == targets[0].shape
+            assert preds.allclose(model(inputs[i]))
+
+            # The score shapes are ok
+            assert set(scores.keys()) == set(["mse", "l1"])
+            assert scores["mse"].shape == ()
+            assert scores["l1"].shape == ()
+
+            # The scores do not have autograd
+            assert scores["mse"].grad_fn is None
+            assert scores["l1"].grad_fn is None
+
+            # The scores are measured correctly
+            assert scores["mse"].allclose(F.mse_loss(model(inputs[i]), targets[i]))
+            assert scores["l1"].allclose(F.l1_loss(model(inputs[i]), targets[i]))
+        
+        assert model.training
+
+        # Evaluation passes over all batches onces
+        assert i == num_batches - 1

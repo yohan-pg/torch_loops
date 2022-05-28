@@ -1,1 +1,1 @@
-from .torch_loops import training_loop, evaluation_loop
+from .torch_loops import TrainingLoop, EvaluationLoop
