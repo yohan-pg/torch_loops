@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "torch_loops"
-version = "0.2.0"
+version = "0.3.0"
 description = "simple loops for pytorch"
 authors = ["yohan-pg <pg.yohan@gmail.com>"]
 license = "MIT"

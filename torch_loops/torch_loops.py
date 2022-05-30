@@ -1,38 +1,9 @@
-import torch
-import torch.nn as nn
-from typing import *  # type: ignore
-from torch.utils.data import DataLoader
-
-from torch.cuda.amp.autocast_mode import autocast
-from torch.cuda.amp.grad_scaler import GradScaler
-from contextlib import nullcontext
-import pandas as pd
-from tqdm import tqdm
-import dataclasses
-from dataclasses import dataclass, field
-
-
-Inputs = TypeVar("Inputs")
-Preds = TypeVar("Preds")
-Targets = TypeVar("Targets")
-
-Loss = torch.Tensor
-Losses = dict[str, Loss]
-
-# Scores are losses which do not require differentiability
-Score = torch.Tensor  
-Scores = dict[str, Score]
-
-Weight = float
-Criterion = Callable[[Preds, Targets], Loss]
-
-
-Metric = Callable[[Preds, Targets], Score]
-
+from .prelude import *
+from .types import *
 
 @dataclass
 class TrainingLoop(Generic[Inputs, Preds, Targets]):
-    model: Callable[[Inputs], Preds]
+    model: Model
     _ = dataclasses.KW_ONLY
     dataloader: Iterable[tuple[Inputs, Targets]]
     criterions: dict[str, tuple[Weight, Criterion]]
@@ -41,12 +12,15 @@ class TrainingLoop(Generic[Inputs, Preds, Targets]):
     amp: bool = True
     seed: int = 0
 
-    _scaler: Optional[GradScaler] = None
+    _scaler: Optional[GradScaler] = field(default=None, repr=False)
 
     def __post_init__(self):
         self._scaler = GradScaler() if self.amp else None
+        self.last_epoch_losses = None
 
-    def step(self, inputs: Inputs, targets: Targets) -> tuple[Preds, dict[str, Loss]]:
+    def step(self, batch: Batch) -> tuple[Preds, dict[str, Loss]]:
+        inputs, targets = batch
+
         preds = self.model(inputs)
 
         losses = {
@@ -61,16 +35,21 @@ class TrainingLoop(Generic[Inputs, Preds, Targets]):
 
         return preds, (losses | {"objective": objective})
 
+    def evaluation(self, batch: Batch):
+        return self.step(batch)[1]
+
     def __iter__(self) -> Iterator[tuple[Preds, Losses]]:
         torch.manual_seed(self.seed)
 
+        epoch_losses = { label: 0.0 for label in self.criterions.keys() }
+
         i = 0
-        for inputs, targets in self.dataloader:
+        for batch in self.dataloader:
             for optimizer in self.optimizers:
                 optimizer.zero_grad()
 
             with autocast() if self.amp else nullcontext():
-                preds, losses = self.step(inputs, targets)
+                preds, losses = self.step(batch)
 
             if self._scaler is not None:
                 self._scaler.scale(losses["objective"]).backward()  # type: ignore
@@ -79,7 +58,7 @@ class TrainingLoop(Generic[Inputs, Preds, Targets]):
 
             for optimizer in self.optimizers:
                 if self._scaler is not None:
-                    self._scaler.step(optimizer) # type: ignore
+                    self._scaler.step(optimizer)  # type: ignore
                 else:
                     optimizer.step()
 
@@ -89,16 +68,24 @@ class TrainingLoop(Generic[Inputs, Preds, Targets]):
             if self._scaler is not None:
                 self._scaler.update()
 
+            for key in self.criterions.keys():
+                epoch_losses[key] += losses[key].item() / len(self)
+
             yield preds, losses
 
             i += 1
 
+        self.last_epoch_losses = epoch_losses
+
+    def __len__(self) -> int:
+        return len(self.dataloader)
+
 
 @dataclass
 class EvaluationLoop(Generic[Inputs, Preds, Targets]):
-    model: Callable[[Inputs], Preds]
+    model: Model
     _ = dataclasses.KW_ONLY
-    dataloader: Iterable[tuple[Inputs, Targets]]
+    dataloader: Iterable[Batch]
     metrics: dict[str, Callable[[Preds, Targets], Score]]
     amp: bool = True
     seed: int = 0
@@ -109,16 +96,18 @@ class EvaluationLoop(Generic[Inputs, Preds, Targets]):
         with torch.inference_mode():
             was_training = self.model.training
             self.model.train(False)
-            
+
             for inputs, targets in self.dataloader:
                 with autocast() if self.amp else nullcontext():
                     preds = self.model(inputs)
                     scores = {
-                        label: criterion(preds, targets)
+                        label: criterion(preds, targets).item()
                         for label, criterion in self.metrics.items()
                     }
 
-                
                     yield preds, scores
 
             self.model.train(was_training)
+
+    def __len__(self) -> int:
+        return len(self.dataloader)
